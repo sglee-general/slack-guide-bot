@@ -18,59 +18,27 @@ export default async function handler(req, res) {
 
   if (event && !event.bot_id) {
 
-    res.status(200).send("ok");
+  try {
+    const channel = event.channel;
+    const question = event.text.replace(/<@.*>/, '').trim();
 
-    (async () => {
-      try {
-        const channel = event.channel;
-        const question = event.text.replace(/<@.*>/, '').trim();
+    console.log("🙋 질문:", question);
 
-        console.log("🙋 질문:", question);
+    // 🔥 여기서 바로 실행 (async 제거)
+    const initialRes = await postToSlack(channel, "🔍 찾는 중...");
+    const ts = initialRes.ts;
 
-        // ✅ 1. 초기 메시지
-        const initialRes = await postToSlack(channel, "🔍 관련 노션 페이지를 빠르게 찾는 중입니다...");
-        const ts = initialRes.ts;
+    const context = await getNotionData(question);
+    const answer = await askAIAgent(question, context);
 
-        // ✅ 2. Notion 최소 검색 (가볍게!)
-        console.log("📚 Notion 검색 시작");
+    await updateSlackMessage(channel, ts, answer);
 
-        const searchRes = await notion.search({
-          query: question,
-          filter: { value: "page", property: "object" },
-          page_size: 3 // 🔥 핵심: 무조건 작게
-        });
+    // 🔥 마지막에 응답
+    return res.status(200).send("ok");
 
-        let context = "";
-
-        for (const page of searchRes.results) {
-          const title = getPageTitle(page);
-
-          const content = await getBlockText(page.id, 0);
-
-          context += `\n[${title}]\n${content}\n`;
-        }
-
-        console.log("📚 Notion 수집 완료 길이:", context.length);
-
-        if (!context) {
-          await updateSlackMessage(channel, ts, "❗ 관련 내용을 노션에서 찾지 못했습니다.");
-          return;
-        }
-
-        // ✅ 3. AI 호출
-        console.log("🤖 AI 호출 시작");
-
-        const answer = await askAIAgent(question, context);
-
-        console.log("🤖 AI 응답 완료");
-
-        // ✅ 4. 슬랙 업데이트
-        await updateSlackMessage(channel, ts, answer);
-
-      } catch (error) {
-        console.error("❌ 전체 에러:", error);
-      }
-    })();
+  } catch (error) {
+    console.error("❌ 에러:", error);
+    return res.status(200).send("error");
   }
 }
 
