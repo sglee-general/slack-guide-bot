@@ -2,93 +2,88 @@ const { Client } = require("@notionhq/client");
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 export default async function handler(req, res) {
+  // 1. 슬랙 재시도 신호 즉시 차단
   if (req.headers['x-slack-retry-num']) return res.status(200).send("ok");
+
+  // 2. URL 검증
   if (req.body.type === 'url_verification') return res.status(200).json({ challenge: req.body.challenge });
 
   const event = req.body.event;
   if (event && !event.bot_id && (event.type === 'app_mention' || event.channel_type === 'im')) {
+    
+    // [핵심] Vercel이 종료되지 않도록res.status(200)을 보내기 전에 모든 비동기 로직을 감쌉니다.
+    // 하지만 슬랙 3초 제한을 피하기 위해 일단 응답은 보냅니다.
     res.status(200).send("ok");
 
+    const channel = event.channel;
+    const question = event.text.replace(/<@.*>/, '').trim();
+    let ts = "";
+
     try {
-      const channel = event.channel;
-      const question = event.text.replace(/<@.*>/, '').trim();
+      // (1) 첫 반응 전송
+      const initialRes = await postToSlack(channel, "🧠 비나우 AI 에이전트가 노션 가이드를 정밀 분석 중입니다...");
+      ts = initialRes.ts;
 
-      const initialRes = await postToSlack(channel, "🧠 비나우 가이드 지도를 펼쳐서 내용을 찾는 중입니다...");
-      const ts = initialRes.ts;
+      // (2) 노션 검색 (notion.search는 하위 페이지까지 몽땅 검색합니다!)
+      // 페이지 제목뿐만 아니라 '단어'가 포함된 모든 곳을 찾습니다.
+      const searchRes = await notion.search({
+        query: question,
+        sort: { direction: 'descending', timestamp: 'last_edited_time' },
+        page_size: 5
+      });
 
-      // [1단계] 최상위 페이지의 하위 페이지 목록(지도)을 가져옴
-      const pageMap = await getNotionMap(process.env.NOTION_PAGE_ID);
-      
-      // [2단계] AI가 어떤 페이지를 읽을지 선택
-      const targetPageId = await askAIToChoosePage(question, pageMap);
-      
-      let context = "";
-      if (targetPageId) {
-        // [3단계] 선택된 페이지의 상세 내용을 읽음
-        context = await getPageContent(targetPageId);
-      } else {
-        // AI가 못 찾으면 전체 검색이라도 시도
-        context = await fallbackSearch(question);
+      let knowledge = "";
+      if (searchRes.results.length > 0) {
+        for (const page of searchRes.results) {
+          if (page.object === 'page') {
+            const blocks = await notion.blocks.children.list({ block_id: page.id, page_size: 20 });
+            const pageText = blocks.results
+              .map(b => b[b.type]?.rich_text?.map(t => t.plain_text).join("") || "")
+              .join(" ");
+            knowledge += `[가이드: ${page.id}] ${pageText}\n`;
+          }
+        }
       }
 
-      // [4단계] 최종 답변 생성
-      const answer = await askGeminiFinal(question, context);
+      // (3) AI(Gemini)에게 에이전트 역할 부여
+      const answer = await askGeminiAgent(question, knowledge);
+
+      // (4) 답변 업데이트
       await updateSlackMessage(channel, ts, answer);
 
     } catch (error) {
-      console.error("에러:", error);
+      console.error("실행 에러:", error);
+      if (ts) await updateSlackMessage(channel, ts, `❌ 오류가 발생했어요: ${error.message}`);
     }
+    return;
   }
 }
 
-// 노션 하위 페이지들의 제목과 ID를 싹 긁어오는 함수
-async function getNotionMap(rootId) {
-  const response = await notion.blocks.children.list({ block_id: rootId });
-  return response.results
-    .filter(b => b.type === 'child_page')
-    .map(b => ({ id: b.id, title: b.child_page.title }));
+async function askGeminiAgent(question, context) {
+  const prompt = `당신은 비나우(BENOW)의 업무 가이드 에이전트입니다.
+제공된 [사내 지식 데이터]를 바탕으로 질문에 답하세요.
+
+[사내 지식 데이터]
+${context || "관련 내용을 찾지 못했습니다."}
+
+[질문]
+${question}
+
+[지침]
+1. 자연어 질문(예: 주차 어떻게 해?)을 받으면 지식 데이터에서 '주차' 관련 내용을 찾아 요약하세요.
+2. 데이터가 부족해도 아는 범위 내에서 최대한 친절히 답하고, 모르면 사업지원팀을 안내하세요.
+3. 답변은 간결하고 명확하게, 슬랙 메시지 형식으로 작성하세요.`;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+      method: 'POST',
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+    });
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || "🤔 답변을 구성할 지식이 부족합니다. 노션 가이드를 확인해 주세요.";
+  } catch (e) { return "AI 엔진 호출 실패"; }
 }
 
-// AI가 질문을 보고 어떤 페이지로 들어갈지 결정하는 함수
-async function askAIToChoosePage(question, pageMap) {
-  const mapText = pageMap.map(p => `- ${p.title} (ID: ${p.id})`).join("\n");
-  const prompt = `사용자 질문: "${question}"\n\n아래 노션 페이지 목록 중 질문과 가장 연관 있는 페이지의 ID만 딱 하나 골라줘. 없으면 "NONE"이라고 답해.\n\n${mapText}`;
-  
-  const res = await callGemini(prompt);
-  const match = res.match(/[a-f0-9-]{36}/); // UUID 형식 추출
-  return match ? match[0] : null;
-}
-
-// 선택된 페이지의 본문을 읽어오는 함수
-async function getPageContent(pageId) {
-  const blocks = await notion.blocks.children.list({ block_id: pageId });
-  return blocks.results
-    .map(b => b[b.type]?.rich_text?.map(t => t.plain_text).join("") || "")
-    .filter(t => t).join("\n");
-}
-
-// AI 호출 기본 함수
-async function callGemini(prompt) {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-    method: 'POST',
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-  });
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-}
-
-async function askGeminiFinal(question, context) {
-  const prompt = `당신은 비나우 에이전트입니다. 아래 노션 지식을 바탕으로 질문에 답하세요.\n\n[지식]:\n${context}\n\n[질문]:\n${question}`;
-  return await callGemini(prompt);
-}
-
-// 보조 검색 기능
-async function fallbackSearch(query) {
-  const res = await notion.search({ query, page_size: 3 });
-  return res.results.map(p => p.id).join(", "); // 간단히 구현
-}
-
-// 슬랙 유틸리티 (기존과 동일)
 async function postToSlack(channel, text) {
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
