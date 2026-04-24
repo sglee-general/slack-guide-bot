@@ -2,112 +2,110 @@ const { Client } = require("@notionhq/client");
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 export default async function handler(req, res) {
-  // 어떤 신호든 들어오면 일단 로그부터 찍습니다 (범인 검거용)
-  console.log("📍 수신 데이터:", JSON.stringify(req.body));
-
-  // 1. 슬랙 재시도 방지
-  if (req.headers['x-slack-retry-num']) {
-    console.log("⏩ 재시도 신호 무시");
-    return res.status(200).send("ok");
-  }
-
-  // 2. URL 검증 (최초 연결용)
-  if (req.body.type === 'url_verification') {
-    return res.status(200).json({ challenge: req.body.challenge });
-  }
+  if (req.headers['x-slack-retry-num']) return res.status(200).send("ok");
+  if (req.body.type === 'url_verification') return res.status(200).json({ challenge: req.body.challenge });
 
   const event = req.body.event;
-
-  // 3. 봇에게 온 신호인지 확인 (멘션 or DM)
   if (event && !event.bot_id && (event.type === 'app_mention' || event.channel_type === 'im')) {
+    res.status(200).send("ok");
+
     try {
       const channel = event.channel;
       const question = event.text.replace(/<@.*>/, '').trim();
-      console.log("🔍 처리 시작 - 질문:", question);
-
-      // 슬랙 3초 룰을 위해 먼저 메시지를 보냅니다.
-      const initialRes = await postToSlack(channel, "🧠 노션 가이드를 분석 중입니다. 잠시만 기다려주세요...");
+      
+      // 1. 진행 상황 알림
+      const initialRes = await postToSlack(channel, "🔍 비나우 업무가이드를 정밀 분석 중입니다...");
       const ts = initialRes.ts;
 
-      // [핵심] 노션 전체를 검색 (자연어 대응)
-      const context = await getNotionKnowledge(question);
-      console.log("📚 노션에서 지식 추출 완료");
+      // 2. 노션 지식 베이스 구축 (검색 + 최상위 페이지 하위 탐색)
+      const context = await buildDeepKnowledge(question);
+      console.log("📚 수집된 지식 조각들:", context.substring(0, 200) + "...");
 
-      // [핵심] AI가 답변 생성 (담당자 안내봇의 두뇌)
-      const answer = await askGeminiExpert(question, context);
-      console.log("🤖 AI 답변 생성 완료");
+      // 3. AI 에이전트 답변 생성
+      const answer = await askAIAgent(question, context);
 
-      // 최종 답변으로 업데이트
+      // 4. 답변 업데이트
       await updateSlackMessage(channel, ts, answer);
-      
-      console.log("✅ 모든 프로세스 완료");
-      return res.status(200).json({ ok: true });
     } catch (error) {
       console.error("❌ 에러 발생:", error);
-      await postToSlack(event.channel, "죄송합니다. 처리 중 오류가 발생했어요: " + error.message);
-      return res.status(200).send("error");
+      await postToSlack(event.channel, "죄송합니다. 지식을 찾는 중 에러가 발생했습니다: " + error.message);
     }
+    return;
   }
-
-  console.log("💤 조건에 맞지 않는 이벤트이므로 무시함");
-  return res.status(200).send("ignored");
 }
 
-// 노션에서 내용을 샅샅이 뒤지는 함수 (자연어 검색 강화)
-async function getNotionKnowledge(query) {
+// [핵심] 노션의 지식을 '에이전트' 수준으로 끌어올리는 함수
+async function buildDeepKnowledge(query) {
   try {
-    const response = await notion.search({
-      query: query,
-      sort: { direction: 'descending', timestamp: 'last_edited_time' },
-      page_size: 3 // 가장 연관성 높은 3개 페이지
-    });
-
-    let context = "";
-    for (const page of response.results) {
-      if (page.object === 'page') {
-        const title = page.properties?.title?.title?.[0]?.plain_text || 
-                      page.properties?.Name?.title?.[0]?.plain_text || "가이드";
-        
-        // 페이지의 첫 10개 블록만 빠르게 읽기
-        const blocks = await notion.blocks.children.list({ block_id: page.id, page_size: 10 });
-        const text = blocks.results
-          .map(b => b[b.type]?.rich_text?.[0]?.plain_text || "")
-          .filter(t => t).join(" ");
-        
-        context += `[가이드: ${title}]\n내용: ${text}\n\n`;
-      }
+    // 방법 A: 키워드 검색
+    const searchResponse = await notion.search({ query: query, page_size: 5 });
+    
+    // 방법 B: 최상위 가이드 페이지의 하위 목록 가져오기
+    let rootChildren = { results: [] };
+    if (process.env.NOTION_PAGE_ID) {
+      rootChildren = await notion.blocks.children.list({ block_id: process.env.NOTION_PAGE_ID });
     }
-    return context || "노션에서 관련 내용을 찾지 못했습니다.";
-  } catch (e) {
-    return "노션 지식을 읽어오는 데 실패했습니다.";
+
+    const combinedResults = [...searchResponse.results, ...rootChildren.results];
+    let knowledge = "";
+
+    for (const item of combinedResults) {
+      const pageId = item.id;
+      if (!pageId) continue;
+
+      try {
+        const blocks = await notion.blocks.children.list({ block_id: pageId, page_size: 20 });
+        const text = blocks.results
+          .map(b => b[b.type]?.rich_text?.map(t => t.plain_text).join("") || "")
+          .filter(t => t.length > 5).join("\n");
+        
+        if (text) knowledge += `--- 가이드 조각 ---\n${text}\n\n`;
+      } catch (e) { continue; }
+    }
+
+    return knowledge || "노션 가이드에서 관련 내용을 찾지 못했습니다.";
+  } catch (err) {
+    return "노션 연결 오류";
   }
 }
 
-// AI에게 똑똑하게 답변하라고 시키는 함수
-async function askGeminiExpert(question, context) {
-  const prompt = `비나우(BENOW) 업무지원팀 전문 AI 비서입니다.
-제공된 [노션 가이드]를 기반으로 질문에 답하세요.
+// [핵심] AI에게 '사내 전문가'의 페르소나를 부여
+async function askAIAgent(question, context) {
+  const prompt = `당신은 비나우(BENOW) 사내 정보를 마스터한 에이전트입니다. 
+아래 [사내 가이드 데이터]를 참고하여 질문에 대해 "추측"하지 말고 "사실"에 기반하여 답하세요.
 
-[지침]
-1. 사용자가 자연어로 물어도 가이드 내용을 찾아 친절하게 설명하세요.
-2. 가이드에 근거하여 답변하고, 없는 내용은 모른다고 하세요.
-3. wifi 비밀번호, 주차 등록 방법 등 핵심 정보를 정확히 전달하세요.
-
-[노션 가이드]:
+[사내 가이드 데이터]
 ${context}
 
-[질문]:
-${question}`;
+[질문]
+${question}
 
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-    method: 'POST',
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-  });
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "답변을 구성하지 못했습니다.";
+[답변 가이드라인]
+1. 자연스럽고 친절한 문체로 답변하세요.
+2. 만약 데이터에 "와이파이 비밀번호"나 "주차 신청 링크"가 있다면 무조건 포함하세요.
+3. 데이터에 내용이 전혀 없다면, "현재 가이드에는 해당 내용이 없습니다. 구체적인 키워드(예: 주차, 연차, wifi)로 다시 물어봐 주시겠어요?"라고 답하세요.
+4. 질문자가 "와이파이"라고 묻든 "wifi"라고 묻든 동일하게 처리하세요.`;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+      method: 'POST',
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+    });
+    const data = await res.json();
+    
+    // API 에러 발생 시 로그 확인용
+    if (data.error) {
+      console.error("Gemini API 에러:", data.error.message);
+      return "🤖 AI 엔진 응답 오류: " + data.error.message;
+    }
+
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || "🤔 가이드를 읽어보았으나 명확한 답변을 생성하기 어렵습니다. 노션 가이드 내용을 조금 더 자세히 적어주시면 도움이 됩니다.";
+  } catch (e) {
+    return "🤖 AI 답변 생성 중 시스템 오류가 발생했습니다.";
+  }
 }
 
-// 슬랙 통신 유틸리티
+// 슬랙 연동 함수들
 async function postToSlack(channel, text) {
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
