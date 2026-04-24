@@ -2,113 +2,91 @@ const { Client } = require("@notionhq/client");
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 export default async function handler(req, res) {
-  // 어떤 신호든 들어오면 로그를 남깁니다.
-  console.log("📡 [신호 감지] 슬랙에서 데이터가 도착했습니다.");
-
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-
-  // 1. URL 검증 (슬랙에서 'Verified'를 유지하기 위해 필수)
-  if (req.body.type === 'url_verification') {
-    return res.status(200).json({ challenge: req.body.challenge });
-  }
+  if (req.headers['x-slack-retry-num']) return res.status(200).send("ok");
+  if (req.body.type === 'url_verification') return res.status(200).json({ challenge: req.body.challenge });
 
   const event = req.body.event;
-
-  // 2. 봇에게 온 이벤트인지 확인 (조건을 대폭 완화)
-  if (event && !event.bot_id) {
-    const channel = event.channel;
-    const userText = event.text || "";
-    
-    // [중요] 슬랙 Retries(재시도)는 무시
-    if (req.headers['x-slack-retry-num']) return res.status(200).send("ok");
-
-    console.log(`❓ 질문 인식: "${userText}"`);
+  if (event && !event.bot_id && (event.type === 'app_mention' || event.channel_type === 'im')) {
+    res.status(200).send("ok");
 
     try {
-      // 질문에서 멘션 태그(@봇이름) 제거
-      const cleanedQuestion = userText.replace(/<@.*>/, '').trim();
+      const channel = event.channel;
+      const question = event.text.replace(/<@.*>/, '').trim();
 
-      // (1) 즉시 첫 반응 보내기 (Vercel 타임아웃 방지용)
-      const initialRes = await postToSlack(channel, "🔍 비나우 지식 가이드를 분석 중입니다. 잠시만 기다려주세요...");
+      // 1. 첫 반응 (봇이 살아있음을 알림)
+      const initialRes = await postToSlack(channel, "🔍 해당 내용이 적힌 노션 페이지를 정밀 스캔 중입니다...");
       const ts = initialRes.ts;
 
-      // (2) 노션에서 관련 페이지들을 샅샅이 뒤져 지식 추출 (AI 에이전트 핵심 로직)
-      const knowledgeContext = await getDeepKnowledge(cleanedQuestion);
-
-      // (3) AI(Gemini)에게 지식과 질문을 주고 답변 생성
-      const finalAnswer = await askAIAgent(cleanedQuestion, knowledgeContext);
-
-      // (4) 답변 완료 메시지로 업데이트
-      await updateSlackMessage(channel, ts, finalAnswer);
+      // 2. [핵심] 검색 결과에서 '내용'을 긁어오는 로직을 대폭 강화
+      const context = await getFullContentFromNotion(question);
       
-      console.log("✅ 답변 전송 완료!");
-      return res.status(200).send("ok");
+      console.log("📝 수집된 지식 내용:", context);
 
+      // 3. AI에게 지식 전달 (이때 AI가 wifi와 와이파이를 매칭함)
+      const answer = await askAIAgent(question, context);
+
+      // 4. 답변 업데이트
+      await updateSlackMessage(channel, ts, answer);
     } catch (error) {
-      console.error("❌ 에러 발생:", error);
-      return res.status(200).send("error");
+      console.error("❌ 에러:", error);
     }
   }
-
-  console.log("💤 대상 이벤트가 아니어서 무시됨 (bot_id 확인 등)");
-  return res.status(200).send("ignored");
 }
 
-// [에이전트 지식 수집 함수]
-async function getDeepKnowledge(query) {
+async function getFullContentFromNotion(query) {
   try {
-    // 키워드뿐만 아니라 제목/본문 등 연관된 모든 페이지 탐색
+    // 제목뿐만 아니라 본문 단어까지 포함된 페이지들을 찾습니다.
     const searchRes = await notion.search({
       query: query,
       sort: { direction: 'descending', timestamp: 'last_edited_time' },
       page_size: 5
     });
 
-    let contextText = "";
+    let combinedKnowledge = "";
+
     for (const page of searchRes.results) {
       if (page.object === 'page') {
-        const title = page.properties?.title?.title?.[0]?.plain_text || 
-                      page.properties?.Name?.title?.[0]?.plain_text || "공통 가이드";
+        // [강화] 해당 페이지의 모든 블록(텍스트, 표, 리스트 등)을 하나도 빠짐없이 읽음
+        const blocks = await notion.blocks.children.list({ block_id: page.id });
         
-        // 페이지의 본문 글자들을 긁어옴
-        const blocks = await notion.blocks.children.list({ block_id: page.id, page_size: 20 });
-        const text = blocks.results
-          .map(b => b[b.type]?.rich_text?.map(t => t.plain_text).join("") || "")
-          .filter(t => t).join("\n");
-        
-        contextText += `[문서 제목: ${title}]\n내용: ${text}\n\n`;
+        const extractedText = blocks.results.map(block => {
+          const type = block.type;
+          // 노션의 다양한 블록 형태(문단, 리스트, 제목, 콜아웃, 표 등)에서 텍스트만 추출
+          const textData = block[type]?.rich_text || block[type]?.text || [];
+          return textData.map(t => t.plain_text).join("");
+        }).filter(t => t.length > 0).join("\n");
+
+        combinedKnowledge += `[페이지 제목: ${page.id}]\n${extractedText}\n\n`;
       }
     }
-    return contextText || "관련된 노션 가이드 내용을 찾지 못했습니다.";
-  } catch (e) { return "지식 추출 실패"; }
+    return combinedKnowledge || "노션에서 텍스트 데이터를 읽어오지 못했습니다. 봇의 페이지 접근 권한을 확인해주세요.";
+  } catch (e) { return "노션 API 오류 발생"; }
 }
 
-// [AI 에이전트 답변 생성 함수]
 async function askAIAgent(question, context) {
-  const prompt = `당신은 비나우(BENOW)의 업무지원팀 AI 에이전트입니다.
-아래 제공된 [사내 노션 가이드] 정보를 바탕으로 질문에 답하세요.
+  const prompt = `당신은 비나우(BENOW) 업무지원팀 AI 에이전트입니다. 
+제공된 [노션 가이드 데이터]에서 사용자의 질문에 대한 답을 찾아 친절하게 설명하세요.
 
-[사내 노션 가이드]
+[노션 가이드 데이터]
 ${context}
 
-[질문]
+[사용자 질문]
 ${question}
 
-[답변 가이드라인]
-1. 사내 정보 마스터답게 친절하고 명확하게 답변하세요.
-2. 질문자가 '와이파이'나 'wifi'처럼 유사한 단어로 물어도 'WI-FI 가이드'를 참고해 답변하세요.
-3. 데이터가 부족하면 모른다고 하고, 사업지원팀 담당자를 찾아달라고 하세요.
-4. "주차", "택배", "링크" 등 중요한 키워드에 대한 정보가 있다면 빠짐없이 포함하세요.`;
+[답변 원칙]
+1. 데이터에 와이파이 비밀번호나 주차 방법 같은 구체적인 정보가 있다면 그대로 전달하세요.
+2. 질문과 데이터의 단어가 조금 달라도(예: wifi-와이파이) 문맥상 같으면 답변하세요.
+3. 만약 데이터가 비어있다면 "해당 페이지에 접근 권한이 없거나 내용이 없습니다."라고 안내하세요.`;
 
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
     method: 'POST',
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
   });
   const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "🤔 가이드를 확인했으나 답변을 구성하기 어렵네요. 노션 가이드를 보강해주세요!";
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "🤔 내용을 찾았으나 AI가 답변을 구성하지 못했습니다.";
 }
 
-// 슬랙 통신 함수
+// 슬랙 함수 (기존과 동일)
 async function postToSlack(channel, text) {
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
