@@ -3,44 +3,33 @@ import { Client } from "@notionhq/client";
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 export default async function handler(req, res) {
-  // 슬랙 재시도 방지
+  console.log("🔥 handler 진입");
+
   if (req.headers['x-slack-retry-num']) {
     return res.status(200).send("ok");
   }
 
-  // 슬랙 URL 인증
   if (req.body.type === 'url_verification') {
     return res.status(200).json({ challenge: req.body.challenge });
   }
 
   const event = req.body.event;
 
-  if (event && !event.bot_id && (event.type === 'app_mention' || event.channel_type === 'im')) {
-    
-    // ✅ 슬랙 3초 제한 대응 (먼저 응답)
+  console.log("📩 event:", JSON.stringify(event));
+
+  // 👉 조건 완화 (무조건 타게)
+  if (event && !event.bot_id) {
+
     res.status(200).send("ok");
 
     (async () => {
       try {
         const channel = event.channel;
-        const question = event.text.replace(/<@.*>/, '').trim();
 
-        console.log("🙋 질문:", question);
+        console.log("🔥 슬랙 전송 직전, 채널:", channel);
 
-        // 1. 초기 응답
-        const initialRes = await postToSlack(channel, "🔍 노션 전체 데이터를 스캔해서 답변 준비 중입니다...");
-        const ts = initialRes.ts;
-
-        // 2. 전체 노션 데이터 수집
-        const context = await getAllNotionContent();
-
-        console.log("📚 수집된 데이터 길이:", context.length);
-
-        // 3. AI 질문
-        const answer = await askAIAgent(question, context);
-
-        // 4. 슬랙 업데이트
-        await updateSlackMessage(channel, ts, answer);
+        // 👉 테스트 메시지
+        await postToSlack(channel, "🔥 테스트 메시지");
 
       } catch (error) {
         console.error("❌ 에러:", error);
