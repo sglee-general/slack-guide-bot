@@ -194,9 +194,11 @@ async function postToSlack(channel, text) {
     body: JSON.stringify({ channel, text })
   });
 
-  return await res.json();
-}
+  const data = await res.json();
+  console.log("📤 Slack 응답:", data); // 👈 이거 추가
 
+  return data;
+}
 async function updateSlackMessage(channel, ts, text) {
   await fetch("https://slack.com/api/chat.update", {
     method: "POST",
