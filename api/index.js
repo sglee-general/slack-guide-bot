@@ -1,105 +1,209 @@
-const { Client } = require("@notionhq/client");
+import { Client } from "@notionhq/client";
+
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 export default async function handler(req, res) {
-  if (req.headers['x-slack-retry-num']) return res.status(200).send("ok");
-  if (req.body.type === 'url_verification') return res.status(200).json({ challenge: req.body.challenge });
+  // 슬랙 재시도 방지
+  if (req.headers['x-slack-retry-num']) {
+    return res.status(200).send("ok");
+  }
+
+  // 슬랙 URL 인증
+  if (req.body.type === 'url_verification') {
+    return res.status(200).json({ challenge: req.body.challenge });
+  }
 
   const event = req.body.event;
+
   if (event && !event.bot_id && (event.type === 'app_mention' || event.channel_type === 'im')) {
+    
+    // ✅ 슬랙 3초 제한 대응 (먼저 응답)
     res.status(200).send("ok");
 
-    try {
-      const channel = event.channel;
-      const question = event.text.replace(/<@.*>/, '').trim();
+    (async () => {
+      try {
+        const channel = event.channel;
+        const question = event.text.replace(/<@.*>/, '').trim();
 
-      // 1. 첫 반응 (봇이 살아있음을 알림)
-      const initialRes = await postToSlack(channel, "🔍 해당 내용이 적힌 노션 페이지를 정밀 스캔 중입니다...");
-      const ts = initialRes.ts;
+        console.log("🙋 질문:", question);
 
-      // 2. [핵심] 검색 결과에서 '내용'을 긁어오는 로직을 대폭 강화
-      const context = await getFullContentFromNotion(question);
-      
-      console.log("📝 수집된 지식 내용:", context);
+        // 1. 초기 응답
+        const initialRes = await postToSlack(channel, "🔍 노션 전체 데이터를 스캔해서 답변 준비 중입니다...");
+        const ts = initialRes.ts;
 
-      // 3. AI에게 지식 전달 (이때 AI가 wifi와 와이파이를 매칭함)
-      const answer = await askAIAgent(question, context);
+        // 2. 전체 노션 데이터 수집
+        const context = await getAllNotionContent();
 
-      // 4. 답변 업데이트
-      await updateSlackMessage(channel, ts, answer);
-    } catch (error) {
-      console.error("❌ 에러:", error);
-    }
+        console.log("📚 수집된 데이터 길이:", context.length);
+
+        // 3. AI 질문
+        const answer = await askAIAgent(question, context);
+
+        // 4. 슬랙 업데이트
+        await updateSlackMessage(channel, ts, answer);
+
+      } catch (error) {
+        console.error("❌ 에러:", error);
+      }
+    })();
   }
 }
 
-async function getFullContentFromNotion(query) {
+//////////////////////////////
+// 🔍 Notion 전체 크롤링
+//////////////////////////////
+
+async function getAllNotionContent() {
   try {
-    // 제목뿐만 아니라 본문 단어까지 포함된 페이지들을 찾습니다.
     const searchRes = await notion.search({
-      query: query,
-      sort: { direction: 'descending', timestamp: 'last_edited_time' },
-      page_size: 5
+      filter: { value: "page", property: "object" },
+      page_size: 20
     });
 
-    let combinedKnowledge = "";
+    let fullText = "";
 
     for (const page of searchRes.results) {
-      if (page.object === 'page') {
-        // [강화] 해당 페이지의 모든 블록(텍스트, 표, 리스트 등)을 하나도 빠짐없이 읽음
-        const blocks = await notion.blocks.children.list({ block_id: page.id });
-        
-        const extractedText = blocks.results.map(block => {
-          const type = block.type;
-          // 노션의 다양한 블록 형태(문단, 리스트, 제목, 콜아웃, 표 등)에서 텍스트만 추출
-          const textData = block[type]?.rich_text || block[type]?.text || [];
-          return textData.map(t => t.plain_text).join("");
-        }).filter(t => t.length > 0).join("\n");
+      const title = getPageTitle(page);
 
-        combinedKnowledge += `[페이지 제목: ${page.id}]\n${extractedText}\n\n`;
+      const content = await getBlockText(page.id);
+
+      fullText += `\n\n[페이지 제목: ${title}]\n${content}`;
+    }
+
+    return fullText || "노션에서 데이터를 읽지 못했습니다.";
+
+  } catch (error) {
+    console.error("❌ Notion 전체 조회 실패:", error);
+    return "노션 API 오류 발생";
+  }
+}
+
+//////////////////////////////
+// 🔁 블록 재귀 탐색
+//////////////////////////////
+
+async function getBlockText(blockId) {
+  let text = "";
+
+  try {
+    const res = await notion.blocks.children.list({
+      block_id: blockId,
+      page_size: 100
+    });
+
+    for (const block of res.results) {
+      const type = block.type;
+      const richText = block[type]?.rich_text || [];
+
+      const plain = richText.map(t => t.plain_text).join("");
+
+      if (plain) {
+        text += plain + "\n";
+      }
+
+      // 🔥 핵심: 자식 블록 재귀 탐색
+      if (block.has_children) {
+        text += await getBlockText(block.id);
       }
     }
-    return combinedKnowledge || "노션에서 텍스트 데이터를 읽어오지 못했습니다. 봇의 페이지 접근 권한을 확인해주세요.";
-  } catch (e) { return "노션 API 오류 발생"; }
+
+  } catch (error) {
+    console.error("❌ 블록 조회 실패:", error);
+  }
+
+  return text;
 }
+
+//////////////////////////////
+// 🏷 페이지 제목 추출
+//////////////////////////////
+
+function getPageTitle(page) {
+  try {
+    const properties = page.properties;
+
+    for (const key in properties) {
+      if (properties[key].type === "title") {
+        return properties[key].title.map(t => t.plain_text).join("");
+      }
+    }
+
+    return "제목 없음";
+  } catch {
+    return "제목 없음";
+  }
+}
+
+//////////////////////////////
+// 🤖 AI 호출 (Gemini)
+//////////////////////////////
 
 async function askAIAgent(question, context) {
-  const prompt = `당신은 비나우(BENOW) 업무지원팀 AI 에이전트입니다. 
-제공된 [노션 가이드 데이터]에서 사용자의 질문에 대한 답을 찾아 친절하게 설명하세요.
+  const prompt = `
+당신은 회사 내부 업무 가이드를 답변하는 AI입니다.
 
-[노션 가이드 데이터]
+[노션 데이터]
 ${context}
 
-[사용자 질문]
+[질문]
 ${question}
 
-[답변 원칙]
-1. 데이터에 와이파이 비밀번호나 주차 방법 같은 구체적인 정보가 있다면 그대로 전달하세요.
-2. 질문과 데이터의 단어가 조금 달라도(예: wifi-와이파이) 문맥상 같으면 답변하세요.
-3. 만약 데이터가 비어있다면 "해당 페이지에 접근 권한이 없거나 내용이 없습니다."라고 안내하세요.`;
+[답변 규칙]
+1. 반드시 노션 데이터 기반으로만 답변
+2. wifi / 와이파이 같은 유사어는 동일하게 판단
+3. 정보가 있으면 정확하게 그대로 전달
+4. 없으면 "업무 가이드에서 찾을 수 없습니다."라고 답변
+`;
 
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-    method: 'POST',
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-  });
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "🤔 내용을 찾았으나 AI가 답변을 구성하지 못했습니다.";
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      }
+    );
+
+    const data = await res.json();
+
+    return data.candidates?.[0]?.content?.parts?.[0]?.text
+      || "🤔 AI가 답변을 생성하지 못했습니다.";
+
+  } catch (error) {
+    console.error("❌ AI 오류:", error);
+    return "AI 응답 중 오류 발생";
+  }
 }
 
-// 슬랙 함수 (기존과 동일)
+//////////////////////////////
+// 💬 Slack 전송
+//////////////////////////////
+
 async function postToSlack(channel, text) {
-  const res = await fetch('https://slack.com/api/chat.postMessage', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+  const res = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
+    },
     body: JSON.stringify({ channel, text })
   });
+
   return await res.json();
 }
 
 async function updateSlackMessage(channel, ts, text) {
-  await fetch('https://slack.com/api/chat.update', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+  await fetch("https://slack.com/api/chat.update", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
+    },
     body: JSON.stringify({ channel, ts, text })
   });
 }
