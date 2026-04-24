@@ -2,120 +2,66 @@ const { Client } = require("@notionhq/client");
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 export default async function handler(req, res) {
-  // 슬랙 재시도 방지 및 연결 확인
+  // 1. 슬랙 재시도 신호 무시 (중복 실행 방지)
   if (req.headers['x-slack-retry-num']) return res.status(200).send("ok");
   if (req.body.type === 'url_verification') return res.status(200).json({ challenge: req.body.challenge });
 
   const event = req.body.event;
-  if (event && event.text && !event.bot_id) {
+  if (event && !event.bot_id && (event.type === 'app_mention' || event.channel_type === 'im')) {
     const channel = event.channel;
     const question = event.text.replace(/<@.*>/, '').trim();
 
     try {
-      // 1. 첫 반응 (슬랙에 즉시 응답)
-      const initial = await postToSlack(channel, "📡 **비나우 AI 에이전트 가동: 가이드 맵을 정밀 분석 중입니다...**");
+      // (1) 첫 반응 전송 (연결 확인용)
+      const initial = await postToSlack(channel, "🔍 **가이드 본문 텍스트 스캔 중... 잠시만 기다려 주세요.**");
       const ts = initial.ts;
 
-      // 2. 노션 '지도' 분석 (메인 페이지의 모든 하위 페이지 목록 가져오기)
-      const rootId = process.env.NOTION_PAGE_ID;
-      const subPages = await getNotionMap(rootId);
-      
-      // 3. AI가 질문에 맞는 페이지를 스스로 선택 (Agent 로직)
-      const targetPageId = await decidePage(question, subPages);
-      
-      let knowledge = "";
-      if (targetPageId) {
-        // 4. [핵심] 선택된 페이지의 본문과 '표' 데이터를 싹 긁어옴
-        knowledge = await getDeepContent(targetPageId);
-      } else {
-        // AI가 지도를 보고도 못 찾으면 일반 검색으로 최후 시도
-        knowledge = await fallbackSearch(question);
+      // (2) 노션 검색 및 데이터 추출
+      const searchRes = await notion.search({ query: question, page_size: 1 });
+      let knowledgeBase = "";
+
+      if (searchRes.results.length > 0) {
+        const pageId = searchRes.results[0].id;
+        // 페이지의 모든 블록을 싹 긁어모음 (표 밖의 텍스트 포함)
+        const blocks = await notion.blocks.children.list({ block_id: pageId, page_size: 50 });
+        knowledgeBase = blocks.results
+          .map(b => {
+            const type = b.type;
+            const richText = b[type]?.rich_text || [];
+            return richText.map(t => t.plain_text).join("");
+          })
+          .filter(t => t.trim().length > 0)
+          .join("\n");
       }
 
-      // 5. 최종 답변 생성 (Gemini 1.5 Flash 사용)
-      const finalAnswer = await askGeminiExpert(question, knowledge);
+      // (3) AI 답변 생성 (가장 정확한 1.5-flash 모델)
+      const answer = await askAI(question, knowledgeBase);
 
-      // 6. 슬랙 메시지 업데이트
-      await updateSlackMessage(channel, ts, finalAnswer);
+      // (4) 답변 업데이트 (이 작업이 끝날 때까지 서버는 살아있습니다)
+      await updateSlackMessage(channel, ts, answer);
       
+      // [핵심] 모든 일이 "완전하게" 끝난 후에만 응답을 보냅니다.
       return res.status(200).send("ok");
+
     } catch (error) {
-      console.error("에러:", error);
-      return res.status(200).send("error");
+      console.error("에러 발생:", error.message);
+      return res.status(200).send("ok"); // 에러가 나도 슬랙 재시도는 막아야 함
     }
   }
-  return res.status(200).send("ignored");
 }
 
-// 메인 페이지에서 하위 페이지 제목과 ID를 싹 가져오는 함수
-async function getNotionMap(blockId) {
-  const response = await notion.blocks.children.list({ block_id: blockId });
-  return response.results
-    .filter(b => b.type === 'child_page')
-    .map(b => ({ id: b.id, title: b.child_page.title }));
-}
+async function askAI(question, context) {
+  const prompt = `비나우(BENOW) 전문 에이전트입니다. 아래 노션 지식을 바탕으로 질문에 답하세요.
+불렛 포인트나 일반 텍스트에 적힌 비밀번호(PW), SSID 정보를 절대 놓치지 마세요.
+[지식]: ${context || "내용을 읽지 못했습니다."}
+[질문]: ${question}`;
 
-// AI가 목차를 보고 어떤 페이지로 들어갈지 결정
-async function decidePage(question, pages) {
-  const mapList = pages.map(p => `- ${p.title} (ID: ${p.id})`).join("\n");
-  const prompt = `사용자 질문: "${question}"\n\n아래 노션 가이드 목록 중 답변을 찾기에 가장 적합한 페이지의 ID만 골라줘. 없으면 "NONE"이라고 해.\n\n${mapList}`;
-  
-  const res = await callGemini(prompt);
-  const match = res.match(/[a-f0-9-]{36}/);
-  return match ? match[0] : null;
-}
-
-// [핵심] 페이지 내부의 모든 텍스트와 '표'를 긁어오는 함수
-async function getDeepContent(blockId) {
-  let content = "";
-  const blocks = await notion.blocks.children.list({ block_id: blockId });
-  
-  for (const block of blocks.results) {
-    const type = block.type;
-    const value = block[type];
-    
-    // 일반 텍스트 추출
-    if (value?.rich_text) {
-      content += value.rich_text.map(t => t.plain_text).join("") + "\n";
-    }
-    // 표(Table) 내부 데이터 추출
-    if (type === 'table') {
-      const rows = await notion.blocks.children.list({ block_id: block.id });
-      for (const row of rows.results) {
-        if (row.type === 'table_row') {
-          content += "| " + row.table_row.cells.map(cell => cell.map(t => t.plain_text).join(" ")).join(" | ") + " |\n";
-        }
-      }
-    }
-  }
-  return content;
-}
-
-async function fallbackSearch(query) {
-  const res = await notion.search({ query, page_size: 2 });
-  if (res.results.length > 0) return await getDeepContent(res.results[0].id);
-  return "";
-}
-
-async function callGemini(prompt) {
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
     method: 'POST',
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
   });
   const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-}
-
-async function askGeminiExpert(question, context) {
-  const prompt = `당신은 비나우(BENOW) 사내 지식 에이전트입니다. 아래 지식을 바탕으로 질문에 답하세요.
-[지식 베이스]:
-${context || "내용을 찾지 못했습니다."}
-
-[질문]:
-${question}
-
-와이파이 비밀번호(PW), SSID, 공용폴더 경로 등 구체적인 정보가 있다면 누락 없이 답변하세요.`;
-  return await callGemini(prompt);
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "🤔 가이드는 읽었으나 답변 구성에 실패했습니다.";
 }
 
 async function postToSlack(channel, text) {
