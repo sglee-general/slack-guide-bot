@@ -1,51 +1,65 @@
 const { Client } = require("@notionhq/client");
 
-// 1. 초기 설정
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 export default async function handler(req, res) {
+  // 1. 슬랙의 신호를 받았는지 로그로 확인
+  console.log("📨 신호 수신:", JSON.stringify(req.body));
+
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  // 슬랙 URL 검증용
   if (req.body.type === 'url_verification') {
     return res.status(200).json({ challenge: req.body.challenge });
   }
 
-  // 슬랙 이벤트(메시지) 수신
   const event = req.body.event;
-  if (event && (event.type === 'app_mention' || (event.channel_type === 'im' && !event.bot_id))) {
+  // 봇 본인의 메시지에는 반응하지 않도록 필터링
+  if (event && !event.bot_id && (event.type === 'app_mention' || event.channel_type === 'im')) {
     
-    // 1단계: 슬랙에 "확인 중" 메시지 먼저 보내기 (3초 타임아웃 방지)
-    res.status(200).send(""); 
-    const initialMsg = await postToSlack(event.channel, "🔍 노션 가이드에서 내용을 찾고 있습니다. 잠시만 기다려주세요...");
-
     try {
-      // 2단계: 노션에서 관련 내용 검색
-      const question = event.text.replace(/<@.*>/, '').trim(); // 멘션 태그 제거
+      const channel = event.channel;
+      const question = event.text.replace(/<@.*>/, '').trim();
+      console.log("❓ 질문 발견:", question);
+
+      // [핵심 수정] Vercel이 잠들지 않도록 모든 작업을 마친 후 응답을 보냅니다.
+      
+      // 1. 먼저 "찾는 중" 메시지 보내기
+      const initialRes = await postToSlack(channel, "🔍 노션 가이드를 확인하고 있습니다. 잠시만요...");
+      const ts = initialRes.ts;
+
+      // 2. 노션 검색
+      console.log("📚 노션 뒤지는 중...");
       const context = await searchNotionContent(question);
 
-      // 3단계: AI(Gemini)에게 답변 요청
+      // 3. AI 답변 생성
+      console.log("🤖 AI 생각 중...");
       const answer = await askGemini(question, context);
 
-      // 4단계: 기존 메시지 업데이트 (또는 새 메시지 전송)
-      await updateSlackMessage(event.channel, initialMsg.ts, answer);
+      // 4. 슬랙 메시지 수정하여 답변 완료
+      await updateSlackMessage(channel, ts, answer);
+      console.log("✅ 답변 전송 완료!");
+
+      // 모든 작업이 끝난 뒤에 OK를 보냅니다.
+      return res.status(200).send("ok");
 
     } catch (error) {
-      console.error("에러 발생:", error);
-      await updateSlackMessage(event.channel, initialMsg.ts, "❌ 내용을 찾는 중에 에러가 발생했습니다: " + error.message);
+      console.error("❌ 에러 발생 상세:", error);
+      // 에러가 나면 슬랙에 알려주기
+      await postToSlack(event.channel, "😭 죄송해요. 오류가 발생했어요: " + error.message);
+      return res.status(200).send("error");
     }
-    return;
   }
+
+  return res.status(200).send("ignored");
 }
 
-// [노션 검색 함수]
 async function searchNotionContent(query) {
   const response = await notion.search({
     query: query,
     filter: { property: 'object', value: 'page' },
     page_size: 3
   });
-
+  
   let fullContent = "";
   for (const page of response.results) {
     const blocks = await notion.blocks.children.list({ block_id: page.id });
@@ -53,23 +67,14 @@ async function searchNotionContent(query) {
       .filter(b => b.type === 'paragraph')
       .map(b => b.paragraph.rich_text.map(t => t.plain_text).join(""))
       .join("\n");
-    fullContent += `[페이지: ${page.properties.title?.title[0]?.plain_text || "제목없음"}]\n${text}\n\n`;
+    fullContent += `[가이드: ${page.properties.title?.title[0]?.plain_text || "내용"}]\n${text}\n\n`;
   }
-  return fullContent || "관련 가이드 내용을 찾을 수 없습니다.";
+  return fullContent || "관련 내용을 노션에서 찾지 못했습니다.";
 }
 
-// [Gemini AI 답변 함수]
 async function askGemini(question, context) {
-  const prompt = `당신은 비나우(BENOW)의 업무 가이드 안내 봇입니다. 
-아래 제공된 [노션 가이드 내용]을 바탕으로 사용자의 질문에 친절하게 답변하세요. 
-내용에 없는 정보라면 억지로 만들지 말고 모른다고 답변하세요.
-
-[노션 가이드 내용]:
-${context}
-
-[사용자 질문]:
-${question}`;
-
+  const prompt = `비나우 업무 가이드 봇입니다. 아래 노션 내용을 바탕으로 답변하세요.\n\n[노션 내용]:\n${context}\n\n[질문]:\n${question}`;
+  
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
     method: 'POST',
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
@@ -78,7 +83,6 @@ ${question}`;
   return data.candidates[0].content.parts[0].text;
 }
 
-// [슬랙 유틸리티 함수들]
 async function postToSlack(channel, text) {
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
