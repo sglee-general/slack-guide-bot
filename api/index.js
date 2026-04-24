@@ -1,8 +1,8 @@
-import { Client } from "@notionhq/client";
+const { Client } = require("@notionhq/client");
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   console.log("🔥 handler 진입");
 
   if (req.headers['x-slack-retry-num']) {
@@ -17,37 +17,59 @@ export default async function handler(req, res) {
   console.log("📩 event:", JSON.stringify(event));
 
   if (event && !event.bot_id) {
+    try {
+      const channel = event.channel;
+      const question = event.text.replace(/<@.*>/, '').trim();
 
-  try {
-    const channel = event.channel;
-    const question = event.text.replace(/<@.*>/, '').trim();
+      console.log("🙋 질문:", question);
 
-    console.log("🙋 질문:", question);
+      // 1️⃣ 초기 메시지
+      const initialRes = await postToSlack(channel, "🔍 찾는 중...");
+      const ts = initialRes.ts;
 
-    // 🔥 여기서 바로 실행 (async 제거)
-    const initialRes = await postToSlack(channel, "🔍 찾는 중...");
-    const ts = initialRes.ts;
+      // 2️⃣ Notion 검색 (가볍게)
+      const searchRes = await notion.search({
+        query: question,
+        filter: { value: "page", property: "object" },
+        page_size: 3
+      });
 
-    const context = await getNotionData(question);
-    const answer = await askAIAgent(question, context);
+      let context = "";
 
-    await updateSlackMessage(channel, ts, answer);
+      for (const page of searchRes.results) {
+        const title = getPageTitle(page);
+        const content = await getBlockText(page.id, 0);
+        context += `\n[${title}]\n${content}\n`;
+      }
 
-    // 🔥 마지막에 응답
-    return res.status(200).send("ok");
+      if (!context) {
+        await updateSlackMessage(channel, ts, "❗ 노션에서 찾지 못했습니다.");
+        return res.status(200).send("ok");
+      }
 
-  } catch (error) {
-    console.error("❌ 에러:", error);
-    return res.status(200).send("error");
+      // 3️⃣ AI 호출
+      const answer = await askAIAgent(question, context);
+
+      // 4️⃣ Slack 업데이트
+      await updateSlackMessage(channel, ts, answer);
+
+      return res.status(200).send("ok");
+
+    } catch (error) {
+      console.error("❌ 전체 에러:", error);
+      return res.status(200).send("error");
+    }
   }
-}
+
+  return res.status(200).send("ok");
+};
 
 //////////////////////////////
 // 🔁 블록 탐색 (깊이 제한)
 //////////////////////////////
 
 async function getBlockText(blockId, depth = 0) {
-  if (depth > 1) return ""; // 🔥 깊이 제한
+  if (depth > 1) return "";
 
   let text = "";
 
@@ -98,22 +120,16 @@ function getPageTitle(page) {
 }
 
 //////////////////////////////
-// 🤖 AI (Gemini Flash 사용)
+// 🤖 AI
 //////////////////////////////
 
 async function askAIAgent(question, context) {
   const prompt = `
-다음 노션 데이터 기반으로 질문에 답변하세요.
+다음 데이터를 기반으로 답변하세요.
 
-[데이터]
 ${context}
 
-[질문]
-${question}
-
-[규칙]
-- 데이터에 있는 내용만 사용
-- 없으면 "업무 가이드에서 찾을 수 없습니다."라고 답변
+질문: ${question}
 `;
 
   try {
@@ -121,9 +137,7 @@ ${question}
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }]
         })
@@ -133,11 +147,11 @@ ${question}
     const data = await res.json();
 
     return data.candidates?.[0]?.content?.parts?.[0]?.text
-      || "🤔 AI가 답변을 생성하지 못했습니다.";
+      || "🤔 답변 생성 실패";
 
   } catch (error) {
     console.error("❌ AI 오류:", error);
-    return "AI 응답 중 오류 발생";
+    return "AI 오류 발생";
   }
 }
 
@@ -156,7 +170,7 @@ async function postToSlack(channel, text) {
   });
 
   const data = await res.json();
-  console.log("📤 Slack 응답:", data);
+  console.log("📤 Slack:", data);
 
   return data;
 }
